@@ -21,31 +21,6 @@ from tools import (
 )
 
 
-def _flip_role(msg: ResponseInputItemParam) -> ResponseInputItemParam:
-    if msg.get("type") == "message":
-        msg = cast(EasyInputMessageParam, msg)
-        match msg["role"]:
-            case "user":
-                new_role = "assistant"
-            case "assistant":
-                new_role = "user"
-            case other_role:
-                new_role = other_role
-
-        return EasyInputMessageParam(
-            content=msg["content"],
-            role=new_role,
-            type="message",
-        )
-
-    else:
-        return msg
-
-
-def flip_roles(history: list[ResponseInputItemParam]) -> list[ResponseInputItemParam]:
-    return [_flip_role(msg) for msg in history]
-
-
 def yellow(s: str) -> str:
     return colored(s, "yellow")
 
@@ -171,9 +146,6 @@ verktyget cannot_work_more_on_problem
                     history.append(function_tool_call_param)
                     history.append(function_call_output)
         else:
-            # print("-" * 20)
-            # print(f"{receiver.name}: {response.output_text}")
-
             agent_and_roles: list[tuple[Agent, Literal["assistant", "user"]]] = [
                 (caller, "assistant"),
                 (receiver, "user"),
