@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Any, Literal, Union
 import json
 
 from openai.types.responses import FunctionToolParam, ResponseFunctionToolCall
@@ -38,11 +38,33 @@ feed_cat_tool = FunctionToolParam(
 )
 
 
+class ProblemSolved(BaseModel):
+    type: Literal["problem_solved"]
+    explanation: str
+
+    class Config:
+        extra = "forbid"
+
+
+class NeedMoreInformation(BaseModel):
+    """
+    Either more information is needed or we do not know how to solve the problem
+    """
+
+    type: Literal["need_more_information"]
+    description: str = Field(
+        description="Why we need to know this to solve the problem"
+    )
+    question: str = Field(
+        description="A question that a user can answer to help solve the problem"
+    )
+
+    class Config:
+        extra = "forbid"
+
+
 class CannotWorkMoreOnProblemParams(BaseModel):
-    reason: Literal[
-        "problem_solved", "need_more_information_or_does_not_know_how_to_solve_problem"
-    ]
-    description: str
+    reason: Union[ProblemSolved, NeedMoreInformation]
 
     class Config:
         extra = "forbid"
@@ -101,19 +123,8 @@ def feed_cat(
 
 
 class CannotWorkMoreOnProblem(Exception):
-    def __init__(
-        self,
-        reason: Literal[
-            "problem_solved",
-            "need_more_information_or_does_not_know_how_to_solve_problem",
-        ],
-        description: str,
-    ) -> None:
-        self.reason: Literal[
-            "problem_solved",
-            "need_more_information_or_does_not_know_how_to_solve_problem",
-        ] = reason
-        self.description = description
+    def __init__(self, reason: Union[ProblemSolved, NeedMoreInformation]) -> None:
+        self.reason: Union[ProblemSolved, NeedMoreInformation] = reason
 
 
 def call_tool(
@@ -145,7 +156,6 @@ def call_tool(
         params = CannotWorkMoreOnProblemParams.model_validate_json(arguments)
         raise CannotWorkMoreOnProblem(
             reason=params.reason,
-            description=params.description,
         )
 
     else:

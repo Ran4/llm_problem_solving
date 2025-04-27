@@ -1,4 +1,4 @@
-from typing import Any, Literal, cast
+from typing import Any, Literal, Optional, Union, cast
 import json
 from termcolor import colored
 from openai import OpenAI
@@ -15,6 +15,8 @@ from pydantic import BaseModel, Field
 from config import config
 from tools import (
     CannotWorkMoreOnProblem,
+    NeedMoreInformation,
+    ProblemSolved,
     call_tool,
     format_tool_args_dict,
     get_solver_tools,
@@ -66,29 +68,28 @@ class Agent(BaseModel):
     tools: list[FunctionToolParam] = Field(default_factory=list)
 
 
-class SolveProblemResult(BaseModel):
-    result: Literal[
-        "problem_solved",
-        "need_more_information_or_does_not_know_how_to_solve_problem",
-    ]
-    description: str
+class SolveProblemInterrupt(BaseModel):
+    data: Union[ProblemSolved, NeedMoreInformation]
+    asker_history: list[ResponseInputItemParam] = Field(default_factory=list)
+    solver_history: list[ResponseInputItemParam] = Field(default_factory=list)
 
 
 def solve_problem(
     client: OpenAI,
-    problem_description: str = """
-Mata alla katterna.
-""".strip(),
+    problem_description: str,
+    interrupt: Optional[SolveProblemInterrupt] = None,
 ):
     solver = Agent(
         name="Solver",
-        history=[],
+        history=interrupt.solver_history if interrupt is not None else [],
         instructions="You are a problem solver",
         tools=get_solver_tools(),
     )
     asker = Agent(
         name="Asker",
-        history=[
+        history=interrupt.asker_history
+        if interrupt is not None
+        else [
             EasyInputMessageParam(
                 content=f"""
 Lös följande problem: {problem_description}.
@@ -123,13 +124,15 @@ verktyget cannot_work_more_on_problem
             msg for msg in response.output if isinstance(msg, ResponseFunctionToolCall)
         ]
         if tool_calls:
+            assert caller is asker
             for tool_call in tool_calls:
                 try:
                     function_call_output = call_tool(tool_call)
                 except CannotWorkMoreOnProblem as e:
-                    return SolveProblemResult(
-                        result=e.reason,
-                        description=e.description,
+                    return SolveProblemInterrupt(
+                        data=e.reason,
+                        asker_history=asker.history,
+                        solver_history=solver.history,
                     )
 
                 assert tool_call.id
@@ -181,10 +184,40 @@ def main():
         api_key=config.OPENAI_API_KEY.get_secret_value(),
     )
 
-    result = solve_problem(
-        client,
-    )
-    print("Solve problem result:", result)
+    # problem_description = "Mata alla katterna"
+    problem_description = "Mata alla katterna, men bara om det är söndag idag"
+
+    interrupt = None
+    while True:
+        interrupt = solve_problem(
+            client,
+            problem_description=problem_description,
+            interrupt=interrupt,
+        )
+        if isinstance(interrupt.data, ProblemSolved):
+            print("Problem was solved!", interrupt.data.explanation)
+            break
+
+        elif isinstance(interrupt.data, NeedMoreInformation):
+            print(f"The problem could not be solved: {interrupt.data.description}")
+            answer = input(f"Question: {interrupt.data.question}\n> ")
+            interrupt.asker_history.append(
+                EasyInputMessageParam(
+                    content=answer,
+                    role="user",
+                    type="message",
+                )
+            )
+            interrupt.solver_history.append(
+                EasyInputMessageParam(
+                    content=answer,
+                    role="user",
+                    type="message",
+                )
+            )
+
+        else:
+            raise Exception(interrupt)
 
 
 if __name__ == "__main__":
