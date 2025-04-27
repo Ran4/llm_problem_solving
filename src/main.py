@@ -13,7 +13,12 @@ from openai.types.responses.response_input_param import FunctionCallOutput
 from pydantic import BaseModel, Field
 
 from config import config
-from tools import call_tool, format_tool_args_dict, get_tools
+from tools import (
+    CannotWorkMoreOnProblem,
+    call_tool,
+    format_tool_args_dict,
+    get_solver_tools,
+)
 
 
 def _flip_role(msg: ResponseInputItemParam) -> ResponseInputItemParam:
@@ -86,26 +91,36 @@ class Agent(BaseModel):
     tools: list[FunctionToolParam] = Field(default_factory=list)
 
 
-def main2():
-    client = OpenAI(
-        api_key=config.OPENAI_API_KEY.get_secret_value(),
-    )
+class SolveProblemResult(BaseModel):
+    result: Literal[
+        "problem_solved",
+        "need_more_information_or_does_not_know_how_to_solve_problem",
+    ]
+    description: str
 
-    problem_description = """
+
+def solve_problem(
+    client: OpenAI,
+    problem_description: str = """
 Mata alla katterna.
-""".strip()
-
+""".strip(),
+):
     solver = Agent(
         name="Solver",
         history=[],
         instructions="You are a problem solver",
-        tools=get_tools(),
+        tools=get_solver_tools(),
     )
     asker = Agent(
         name="Asker",
         history=[
             EasyInputMessageParam(
-                content=f"Lös följande problem: {problem_description}",
+                content=f"""
+Lös följande problem: {problem_description}.
+
+När du är klar, eller om du inte kan lösa problemet på annat sätt, anropa
+verktyget cannot_work_more_on_problem
+""".strip(),
                 role="user",
                 type="message",
             )
@@ -134,9 +149,15 @@ Mata alla katterna.
         ]
         if tool_calls:
             for tool_call in tool_calls:
-                function_call_output = call_tool(tool_call)
-                assert tool_call.id
+                try:
+                    function_call_output = call_tool(tool_call)
+                except CannotWorkMoreOnProblem as e:
+                    return SolveProblemResult(
+                        result=e.reason,
+                        description=e.description,
+                    )
 
+                assert tool_call.id
                 function_tool_call_param = ResponseFunctionToolCallParam(
                     arguments=tool_call.arguments,
                     call_id=tool_call.call_id,
@@ -145,12 +166,10 @@ Mata alla katterna.
                     id=tool_call.id,
                     status="in_progress",
                 )
-                caller.history.append(function_tool_call_param)
-                caller.history.append(function_call_output)
 
-                receiver.history.append(function_tool_call_param)
-                receiver.history.append(function_call_output)
-
+                for history in [caller.history, receiver.history]:
+                    history.append(function_tool_call_param)
+                    history.append(function_call_output)
         else:
             # print("-" * 20)
             # print(f"{receiver.name}: {response.output_text}")
@@ -185,5 +204,16 @@ Mata alla katterna.
             caller, receiver = receiver, caller
 
 
+def main():
+    client = OpenAI(
+        api_key=config.OPENAI_API_KEY.get_secret_value(),
+    )
+
+    result = solve_problem(
+        client,
+    )
+    print("Solve problem result:", result)
+
+
 if __name__ == "__main__":
-    main2()
+    main()

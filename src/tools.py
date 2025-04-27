@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 import json
 
 from openai.types.responses import FunctionToolParam, ResponseFunctionToolCall
@@ -23,10 +23,6 @@ list_cats_tool = FunctionToolParam(
 
 
 class FeedCatsParams(BaseModel):
-    """
-    Feeds a cat.
-    """
-
     cat_name: str = Field(description="The name of the cat to feed")
 
     class Config:
@@ -42,10 +38,30 @@ feed_cat_tool = FunctionToolParam(
 )
 
 
-def get_tools():
+class CannotWorkMoreOnProblemParams(BaseModel):
+    reason: Literal[
+        "problem_solved", "need_more_information_or_does_not_know_how_to_solve_problem"
+    ]
+    description: str
+
+    class Config:
+        extra = "forbid"
+
+
+cannot_work_more_on_problem_tool = FunctionToolParam(
+    name="cannot_work_more_on_problem",
+    description="Call this whenever you've finished the problem or if you cannot complete the problem due to needing more help",
+    parameters=CannotWorkMoreOnProblemParams.model_json_schema(),
+    strict=True,
+    type="function",
+)
+
+
+def get_solver_tools():
     return [
         list_cats_tool,
         feed_cat_tool,
+        cannot_work_more_on_problem_tool,
     ]
 
 
@@ -84,9 +100,29 @@ def feed_cat(
     return "There is no cat named {feed_cats_params.cat_name}!"
 
 
+class CannotWorkMoreOnProblem(Exception):
+    def __init__(
+        self,
+        reason: Literal[
+            "problem_solved",
+            "need_more_information_or_does_not_know_how_to_solve_problem",
+        ],
+        description: str,
+    ) -> None:
+        self.reason: Literal[
+            "problem_solved",
+            "need_more_information_or_does_not_know_how_to_solve_problem",
+        ] = reason
+        self.description = description
+
+
 def call_tool(
     tool_call: ResponseFunctionToolCall,
 ) -> FunctionCallOutput:
+    """
+    Raises:
+        CannotWorkMoreOnProblem
+    """
     arguments = tool_call.arguments
     call_id = tool_call.call_id
     name = tool_call.name
@@ -105,8 +141,17 @@ def call_tool(
         feed_cats_params = FeedCatsParams.model_validate_json(arguments)
         result = feed_cat(feed_cats_params)
 
+    elif name == "cannot_work_more_on_problem":
+        params = CannotWorkMoreOnProblemParams.model_validate_json(arguments)
+        raise CannotWorkMoreOnProblem(
+            reason=params.reason,
+            description=params.description,
+        )
+
     else:
-        raise Exception(f"Could not call tool {name} as it was not found")
+        raise Exception(
+            f"Could not call tool {name}({format_tool_args_dict(args_dict)}) as it was not found"  # noqa
+        )
 
     return {
         "call_id": call_id,
