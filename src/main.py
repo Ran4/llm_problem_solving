@@ -1,4 +1,4 @@
-from typing import Any, Literal, Optional, Union, cast
+from typing import Any, Literal, Optional, cast
 import json
 from termcolor import colored
 from openai import OpenAI
@@ -14,9 +14,9 @@ from pydantic import BaseModel, Field
 
 from config import config
 from tools import (
-    CannotWorkMoreOnProblem,
-    NeedMoreInformation,
-    ProblemSolved,
+    AskForMoreInformationArgs,
+    CannotHandleTool,
+    ProblemSolvedArgs,
     call_tool,
     format_tool_args_dict,
     get_solver_tools,
@@ -69,9 +69,36 @@ class Agent(BaseModel):
 
 
 class SolveProblemInterrupt(BaseModel):
-    data: Union[ProblemSolved, NeedMoreInformation]
     asker_history: list[ResponseInputItemParam] = Field(default_factory=list)
     solver_history: list[ResponseInputItemParam] = Field(default_factory=list)
+
+
+def handle_tool_calls(
+    tool_calls: list[ResponseFunctionToolCall],
+) -> tuple[list[ResponseInputItemParam], Optional[CannotHandleTool]]:
+    messages = []
+    for tool_call in tool_calls:
+        assert tool_call.id
+        function_tool_call_param = ResponseFunctionToolCallParam(
+            arguments=tool_call.arguments,
+            call_id=tool_call.call_id,
+            name=tool_call.name,
+            type="function_call",
+            id=tool_call.id,
+            status="in_progress",
+        )
+
+        messages.append(function_tool_call_param)
+
+        try:
+            function_call_output = call_tool(tool_call)
+
+        except CannotHandleTool as e:
+            return messages, e
+
+        messages.append(function_call_output)
+
+    return messages, None
 
 
 def solve_problem(
@@ -79,6 +106,20 @@ def solve_problem(
     problem_description: str,
     interrupt: Optional[SolveProblemInterrupt] = None,
 ):
+    """
+    Tries to solve a problem by having the AI repeatedly talk to itself (
+    using two agent roles: the "asker" and the "solver") until the
+    problem has been solved or more information is needed.
+
+    Returns an object that contains conversation(s) between the asker and the caller,
+    and that conversation will always have a hanging function call (a message of type
+    "function call" that does not have a corresponding "function_call_output"):
+
+    * If it's of name "problem_solved", the problem has been solved.
+
+    * If it's of name "ask_for_more_information", then you need to
+    call `solve_problem` again with an answer.
+    """
     solver = Agent(
         name="Solver",
         history=interrupt.solver_history if interrupt is not None else [],
@@ -125,29 +166,17 @@ verktyget cannot_work_more_on_problem
         ]
         if tool_calls:
             assert caller is asker
-            for tool_call in tool_calls:
-                try:
-                    function_call_output = call_tool(tool_call)
-                except CannotWorkMoreOnProblem as e:
-                    return SolveProblemInterrupt(
-                        data=e.reason,
-                        asker_history=asker.history,
-                        solver_history=solver.history,
-                    )
+            new_messages, cannot_handle_tool = handle_tool_calls(tool_calls)
 
-                assert tool_call.id
-                function_tool_call_param = ResponseFunctionToolCallParam(
-                    arguments=tool_call.arguments,
-                    call_id=tool_call.call_id,
-                    name=tool_call.name,
-                    type="function_call",
-                    id=tool_call.id,
-                    status="in_progress",
+            caller.history.extend(new_messages)
+            receiver.history.extend(new_messages)
+
+            if cannot_handle_tool:
+                return SolveProblemInterrupt(
+                    asker_history=asker.history,
+                    solver_history=solver.history,
                 )
 
-                for history in [caller.history, receiver.history]:
-                    history.append(function_tool_call_param)
-                    history.append(function_call_output)
         else:
             agent_and_roles: list[tuple[Agent, Literal["assistant", "user"]]] = [
                 (caller, "assistant"),
@@ -194,27 +223,32 @@ def main():
             problem_description=problem_description,
             interrupt=interrupt,
         )
-        if isinstance(interrupt.data, ProblemSolved):
-            print("Problem was solved!", interrupt.data.explanation)
+
+        tool_call: ResponseFunctionToolCallParam = cast(
+            ResponseFunctionToolCallParam,
+            interrupt.solver_history[-1],
+        )
+        assert tool_call.get("type") == "function_call"
+
+        if tool_call["name"] == "problem_solved":
+            args = ProblemSolvedArgs.model_validate_json(tool_call["arguments"])
+            print("Problem was solved!", args.explanation)
             break
 
-        elif isinstance(interrupt.data, NeedMoreInformation):
-            print(f"The problem could not be solved: {interrupt.data.description}")
-            answer = input(f"Question: {interrupt.data.question}\n> ")
-            interrupt.asker_history.append(
-                EasyInputMessageParam(
-                    content=answer,
-                    role="user",
-                    type="message",
-                )
+        elif tool_call["name"] == "ask_for_more_information":
+            args = AskForMoreInformationArgs.model_validate_json(tool_call["arguments"])
+            print(
+                f"More information was needed to solve the problem: {args.description}"
             )
-            interrupt.solver_history.append(
-                EasyInputMessageParam(
-                    content=answer,
-                    role="user",
-                    type="message",
-                )
-            )
+            answer = input(f"Question: {args.question}\n> ")
+
+            function_call_output: FunctionCallOutput = {
+                "call_id": tool_call["call_id"],
+                "output": answer,
+                "type": "function_call_output",
+            }
+            interrupt.asker_history.append(function_call_output)
+            interrupt.solver_history.append(function_call_output)
 
         else:
             raise Exception(interrupt)
