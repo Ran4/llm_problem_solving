@@ -1,13 +1,16 @@
-from typing import Any, cast
+from typing import Any, Literal, cast
 import json
-from openai import NOT_GIVEN, OpenAI
+from termcolor import colored
+from openai import OpenAI
 from openai.types.responses import (
     EasyInputMessageParam,
+    FunctionToolParam,
     ResponseFunctionToolCall,
     ResponseFunctionToolCallParam,
     ResponseInputItemParam,
 )
 from openai.types.responses.response_input_param import FunctionCallOutput
+from pydantic import BaseModel, Field
 
 from config import config
 from tools import call_tool, format_tool_args_dict, get_tools
@@ -38,6 +41,18 @@ def flip_roles(history: list[ResponseInputItemParam]) -> list[ResponseInputItemP
     return [_flip_role(msg) for msg in history]
 
 
+def yellow(s: str) -> str:
+    return colored(s, "yellow")
+
+
+def red(s: str) -> str:
+    return colored(s, "red")
+
+
+def blue(s: str) -> str:
+    return colored(s, "blue")
+
+
 def format_msg(msg: ResponseInputItemParam) -> str:
     match msg.get("type"):
         case "message":
@@ -45,10 +60,11 @@ def format_msg(msg: ResponseInputItemParam) -> str:
             role = msg["role"]
             content = msg["content"]
             return f"{role}: {content}"
+
         case "function_call_output":
             msg = cast(FunctionCallOutput, msg)
             output = msg["output"]
-            return f"Tool response {output}"
+            return yellow(f"--> {output}")
 
         case "function_call":
             msg = cast(ResponseFunctionToolCallParam, msg)
@@ -57,10 +73,17 @@ def format_msg(msg: ResponseInputItemParam) -> str:
             name = msg["name"]
 
             args_dict: dict[str, Any] = json.loads(arguments)
-            return f"Tool call {name}({format_tool_args_dict(args_dict)})"
+            return red(f"{name}({format_tool_args_dict(args_dict)})")
 
         case type:
             return f"{type} {msg}"
+
+
+class Agent(BaseModel):
+    name: str
+    history: list[ResponseInputItemParam] = Field(default_factory=list)
+    instructions: str = ""
+    tools: list[FunctionToolParam] = Field(default_factory=list)
 
 
 def main2():
@@ -72,35 +95,37 @@ def main2():
 Mata alla katterna.
 """.strip()
 
-    history: list[ResponseInputItemParam] = [
-        EasyInputMessageParam(
-            content=f"Lös följande problem: {problem_description}",
-            role="user",
-            type="message",
-        )
-    ]
+    solver = Agent(
+        name="Solver",
+        history=[],
+        instructions="You are a problem solver",
+        tools=get_tools(),
+    )
+    asker = Agent(
+        name="Asker",
+        history=[
+            EasyInputMessageParam(
+                content=f"Lös följande problem: {problem_description}",
+                role="user",
+                type="message",
+            )
+        ],
+        instructions="You ask another agent if they finished their mission",
+        tools=[],
+    )
 
-    tools = get_tools()
+    caller, receiver = asker, solver
 
-    i = 1
     while True:
-        agent_name = "Tant Grön" if i % 2 == 0 else "Tant Brun"
-
-        if i % 2 == 0:
-            instructions = "You ask another agent if they finished their mission"
-
-        else:
-            instructions = f"You are a problem solver"
-
-        # print(
-        #     f"\n\n---> Sending\n",
-        #     "\n".join([f"  * {format_msg(msg)}" for msg in history]),
-        # )
+        print(
+            "\n\ninput:\n"
+            + "\n".join([f"  * {format_msg(msg)}" for msg in caller.history])
+        )
         response = client.responses.create(
             model="gpt-4o",
-            instructions=instructions,
-            input=history,
-            tools=tools if i % 2 == 1 else NOT_GIVEN,
+            instructions=caller.instructions,
+            input=caller.history,
+            tools=receiver.tools,
             store=False,
         )
 
@@ -111,41 +136,53 @@ Mata alla katterna.
             for tool_call in tool_calls:
                 function_call_output = call_tool(tool_call)
                 assert tool_call.id
-                history.append(
-                    ResponseFunctionToolCallParam(
-                        arguments=tool_call.arguments,
-                        call_id=tool_call.call_id,
-                        name=tool_call.name,
-                        type="function_call",
-                        id=tool_call.id,
-                        status="in_progress",
-                    )
+
+                function_tool_call_param = ResponseFunctionToolCallParam(
+                    arguments=tool_call.arguments,
+                    call_id=tool_call.call_id,
+                    name=tool_call.name,
+                    type="function_call",
+                    id=tool_call.id,
+                    status="in_progress",
                 )
-                history.append(function_call_output)
+                caller.history.append(function_tool_call_param)
+                caller.history.append(function_call_output)
+
+                receiver.history.append(function_tool_call_param)
+                receiver.history.append(function_call_output)
 
         else:
-            print("-" * 20)
-            print(f"{agent_name}: {response.output_text}")
+            # print("-" * 20)
+            # print(f"{receiver.name}: {response.output_text}")
 
-            history.append(
-                EasyInputMessageParam(
-                    content=response.output_text,
-                    role="assistant",
-                    type="message",
+            agent_and_roles: list[tuple[Agent, Literal["assistant", "user"]]] = [
+                (caller, "assistant"),
+                (receiver, "user"),
+            ]
+            for agent, role in agent_and_roles:
+                agent.history.append(
+                    EasyInputMessageParam(
+                        content=response.output_text,
+                        role=role,
+                        type="message",
+                    )
                 )
-            )
 
-            history.append(
-                EasyInputMessageParam(
-                    content="Har du löst problemet än?",
-                    role="user",
-                    type="message",
+            agent_and_roles: list[tuple[Agent, Literal["assistant", "user"]]] = [
+                (receiver, "assistant"),
+                (caller, "user"),
+            ]
+            for agent, role in agent_and_roles:
+                agent.history.append(
+                    EasyInputMessageParam(
+                        content="Har du löst problemet än?",
+                        role=role,
+                        type="message",
+                    )
                 )
-            )
 
-            history = flip_roles(history)
-
-            i += 1
+            # They switch roles
+            caller, receiver = receiver, caller
 
 
 if __name__ == "__main__":
